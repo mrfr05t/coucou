@@ -35,12 +35,16 @@ enum Endpoint {
     Chat,
 }
 
-/// What turned out to work for one base URL: which route exists, and whether
-/// the server accepts our web search tool.
+/// What turned out to work for one base URL: which route exists, whether the
+/// server accepts our web search tool, and whether it can take attachments at
+/// all. llama.cpp answers `/responses` but refuses `input_file`, and answers
+/// images with a 500 when the model has no projector — each of those is worth
+/// one downgrade, not a dead end in the island.
 #[derive(Clone, Copy)]
 struct Policy {
     endpoint: Endpoint,
     search: bool,
+    media: bool,
 }
 
 /// What each base URL turned out to accept, so a new base URL in settings is
@@ -89,13 +93,14 @@ pub async fn send(
     Ok(ChatReply { text })
 }
 
-/// Climb the route ladder at most twice — once to fall back to Chat
-/// Completions, once to drop a web search tool the server refuses.
+/// Climb the ladder at most three steps deep — route, then web search, then
+/// attachments — so a server that only half-implements the API still ends up
+/// answering instead of showing the island an error.
 async fn turn(chat: &Chat, base: &str, key: Option<&str>, model: &str) -> Result<String, String> {
     let mut policy = policy_for(base);
     let history = chat.snapshot();
 
-    for _ in 0..3 {
+    for _ in 0..4 {
         let (url, body) = build(base, &policy, model, &history);
         let response = post(&url, key, &body).await?;
 
@@ -108,6 +113,7 @@ async fn turn(chat: &Chat, base: &str, key: Option<&str>, model: &str) -> Result
         let route_missing = matches!(status, 404 | 405 | 501);
         let search_rejected =
             (400..500).contains(&status) && mentions(&detail, &["web_search", "\"tools\"", "unknown parameter"]);
+        let media_rejected = mentions(&detail, &["input_file", "input_image", "image input", "mmproj"]);
 
         if route_missing && policy.endpoint == Endpoint::Responses {
             policy.endpoint = Endpoint::Chat;
@@ -116,6 +122,11 @@ async fn turn(chat: &Chat, base: &str, key: Option<&str>, model: &str) -> Result
         }
         if search_rejected && policy.search {
             policy.search = false;
+            remember(base, policy);
+            continue;
+        }
+        if media_rejected && policy.media && has_media(&history) {
+            policy.media = false;
             remember(base, policy);
             continue;
         }
@@ -131,7 +142,7 @@ fn policy_for(base: &str) -> Policy {
         .lock()
         .ok()
         .and_then(|guard| guard.iter().find(|(b, _)| b == base).map(|(_, p)| *p))
-        .unwrap_or(Policy { endpoint: Endpoint::Responses, search: true })
+        .unwrap_or(Policy { endpoint: Endpoint::Responses, search: true, media: true })
 }
 
 fn remember(base: &str, policy: Policy) {
@@ -168,7 +179,7 @@ fn build(base: &str, policy: &Policy, model: &str, history: &[Value]) -> (String
             let mut body = json!({
                 "model": model,
                 "instructions": SYSTEM_PROMPT,
-                "input": render_responses(history),
+                "input": render_responses(history, policy),
                 "max_output_tokens": MAX_TOKENS,
             });
             if policy.search {
@@ -180,7 +191,7 @@ fn build(base: &str, policy: &Policy, model: &str, history: &[Value]) -> (String
             format!("{base}/chat/completions"),
             json!({
                 "model": model,
-                "messages": render_chat(history),
+                "messages": render_chat(history, policy),
                 // `max_tokens`, not `max_completion_tokens`: this path exists
                 // precisely for servers that clone the original API, and every
                 // one of them accepts this name.
@@ -249,7 +260,11 @@ fn context_parts(context: &Option<ChatContext>) -> Option<Vec<Value>> {
     }
 }
 
-fn render_responses(history: &[Value]) -> Vec<Value> {
+/// `type` is not optional in practice. OpenAI's "easy input" lets you omit it,
+/// but llama.cpp's Responses parser refuses an assistant item without it —
+/// 400 `Cannot determine type of 'item'`, i.e. every turn after the first.
+/// Sending the documented form costs nothing and works on both.
+fn render_responses(history: &[Value], policy: &Policy) -> Vec<Value> {
     history
         .iter()
         .filter_map(|message| {
@@ -257,24 +272,59 @@ fn render_responses(history: &[Value]) -> Vec<Value> {
             let parts = message.get("parts").and_then(Value::as_array)?;
             let content: Vec<Value> = parts
                 .iter()
-                .filter_map(|p| match p.get("kind").and_then(Value::as_str)? {
-                    "text" => Some(json!({ "type": "input_text", "text": part_text(p) })),
-                    "image" => Some(json!({ "type": "input_image", "image_url": data_uri(p) })),
-                    "document" => Some(json!({ "type": "input_file", "file_url": data_uri(p) })),
-                    _ => None,
+                .filter_map(|p| {
+                    let kind = p.get("kind").and_then(Value::as_str)?;
+                    if !policy.media && (kind == "image" || kind == "document") {
+                        return Some(json!({ "type": "input_text", "text": media_note(kind, p) }));
+                    }
+                    match kind {
+                        "text" => Some(json!({ "type": "input_text", "text": part_text(p) })),
+                        "image" => Some(json!({ "type": "input_image", "image_url": data_uri(p) })),
+                        "document" => Some(json!({
+                            "type": "input_file",
+                            "file_url": data_uri(p),
+                            "filename": p.get("name").and_then(Value::as_str).unwrap_or("attachment"),
+                        })),
+                        _ => None,
+                    }
                 })
                 .collect();
             (!content.is_empty()).then(|| {
-                json!({
-                    "role": if role == "assistant" { "assistant" } else { "user" },
-                    "content": content,
-                })
+                let role = if role == "assistant" { "assistant" } else { "user" };
+                let mut item = json!({ "type": "message", "role": role, "content": content });
+                if role == "assistant" {
+                    // Required by the spec, tolerated as absent, but the strict
+                    // servers are the ones that needed fixing anyway.
+                    item["status"] = json!("completed");
+                }
+                item
             })
         })
         .collect()
 }
 
-fn render_chat(history: &[Value]) -> Vec<Value> {
+/// What to tell the model when the server cannot take the attachment at all.
+/// The turn still goes through, minus the bytes, rather than erroring out.
+fn media_note(kind: &str, part: &Value) -> String {
+    let name = part.get("name").and_then(Value::as_str).unwrap_or("attachment");
+    let what = if kind == "image" { "images" } else { "PDFs" };
+    format!("[{name} was attached, but this endpoint cannot read {what}]")
+}
+
+fn has_media(history: &[Value]) -> bool {
+    history.iter().any(|message| {
+        message
+            .get("parts")
+            .and_then(Value::as_array)
+            .map_or(false, |parts| {
+                parts.iter().any(|p| {
+                    matches!(p.get("kind").and_then(Value::as_str), Some("image" | "document"))
+                })
+            })
+    })
+}
+
+fn render_chat(history: &[Value], policy: &Policy) -> Vec<Value> {
     let mut out = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
 
     for message in history {
@@ -283,7 +333,7 @@ fn render_chat(history: &[Value]) -> Vec<Value> {
 
         let mut texts: Vec<String> = Vec::new();
         let mut items: Vec<Value> = Vec::new();
-        let mut has_media = false;
+        let mut carries_media = false;
 
         for part in parts {
             match part.get("kind").and_then(Value::as_str) {
@@ -292,28 +342,27 @@ fn render_chat(history: &[Value]) -> Vec<Value> {
                     items.push(json!({ "type": "text", "text": text }));
                     texts.push(text);
                 }
-                Some("image") => {
+                // Chat Completions takes images but has no file part, and a
+                // server that refused attachments gets them as a note instead.
+                Some(kind) if kind == "image" && policy.media => {
                     items.push(json!({ "type": "image_url", "image_url": { "url": data_uri(part) } }));
-                    has_media = true;
+                    carries_media = true;
                 }
-                Some("document") => {
-                    // Chat Completions has no file part. Say so rather than
-                    // quietly dropping the attachment.
-                    let name = part.get("name").and_then(Value::as_str).unwrap_or("attachment");
-                    let note = format!("[{name} was attached, but this endpoint cannot read PDFs]");
+                Some(kind) if kind == "image" || kind == "document" => {
+                    let note = media_note(kind, part);
                     items.push(json!({ "type": "text", "text": note }));
                     texts.push(note);
                 }
                 _ => {}
             }
         }
-        if texts.is_empty() && !has_media {
+        if texts.is_empty() && !carries_media {
             continue;
         }
 
         out.push(json!({
             "role": if role == "assistant" { "assistant" } else { "user" },
-            "content": if has_media { Value::Array(items) } else { Value::String(texts.join("\n\n")) },
+            "content": if carries_media { Value::Array(items) } else { Value::String(texts.join("\n\n")) },
         }));
     }
     out
@@ -443,6 +492,11 @@ mod tests {
         json!({ "role": role, "parts": parts })
     }
 
+    /// A policy that allows everything — what a well-behaved server gets.
+    fn allowing() -> Policy {
+        Policy { endpoint: Endpoint::Responses, search: true, media: true }
+    }
+
     #[test]
     fn a_bare_origin_gains_the_v1_segment() {
         assert_eq!(normalise_base("https://api.openai.com"), "https://api.openai.com/v1");
@@ -457,7 +511,7 @@ mod tests {
             turn("user", vec![text_part("hello"), text_part("second line")]),
             turn("assistant", vec![text_part("hi")]),
         ];
-        let rendered = render_chat(&history);
+        let rendered = render_chat(&history, &allowing());
 
         assert_eq!(rendered[0]["role"], "system");
         assert_eq!(rendered[1]["content"], "hello\n\nsecond line");
@@ -474,7 +528,7 @@ mod tests {
                 text_part("File: notes.pdf"),
             ],
         )];
-        let content = render_chat(&history)[1]["content"].clone();
+        let content = render_chat(&history, &allowing())[1]["content"].clone();
         let text = content.as_str().expect("text-only turn stays a string");
         assert!(text.contains("notes.pdf was attached"));
     }
@@ -482,11 +536,53 @@ mod tests {
     #[test]
     fn the_responses_route_maps_parts_to_input_blocks() {
         let history = vec![turn("user", vec![text_part("hello")])];
-        let rendered = render_responses(&history);
+        let rendered = render_responses(&history, &allowing());
 
         assert_eq!(rendered[0]["role"], "user");
         assert_eq!(rendered[0]["content"][0]["type"], "input_text");
         assert_eq!(rendered[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn every_responses_item_carries_the_type_llamacpp_needs() {
+        // Seen live: llama.cpp answers 400 `Cannot determine type of 'item'`
+        // to an item that has role+content but no type — which, without this,
+        // is every turn after the first. OpenAI accepts the same body either way.
+        let history = vec![
+            turn("user", vec![text_part("hi")]),
+            turn("assistant", vec![text_part("hello there")]),
+        ];
+        let rendered = render_responses(&history, &allowing());
+
+        assert_eq!(rendered[0]["type"], "message");
+        assert_eq!(rendered[1]["type"], "message");
+        assert_eq!(rendered[1]["role"], "assistant");
+        assert_eq!(rendered[1]["status"], "completed");
+    }
+
+    #[test]
+    fn an_attachment_the_server_refuses_becomes_words_not_an_error() {
+        let history = vec![turn(
+            "user",
+            vec![
+                media_part("image", "shot.png", "image/png", "AAAA"),
+                text_part("File: shot.png"),
+                text_part("what is this"),
+            ],
+        )];
+        assert!(has_media(&history));
+        let mute = Policy { endpoint: Endpoint::Responses, search: true, media: false };
+
+        let responses = render_responses(&history, &mute);
+        assert_eq!(responses[0]["content"][0]["type"], "input_text");
+        assert!(responses[0]["content"][0]["text"].as_str().unwrap().contains("shot.png"));
+        // no stray base64 anywhere in the muted body
+        assert!(!responses[0]["content"].to_string().contains("AAAA"));
+
+        let chat = render_chat(&history, &mute);
+        let content = chat[1]["content"].as_str().expect("no media left, so a plain string");
+        assert!(content.contains("shot.png was attached"));
+        assert!(content.contains("what is this"));
     }
 
     #[test]
@@ -498,7 +594,7 @@ mod tests {
                 { "type": "message", "content": [{ "type": "output_text", "text": "two" }] },
             ]
         });
-        let policy = Policy { endpoint: Endpoint::Responses, search: true };
+        let policy = allowing();
         assert_eq!(extract(&policy, &body.to_string()).unwrap(), "one\ntwo");
     }
 
@@ -507,14 +603,14 @@ mod tests {
         let body = json!({
             "output": [{ "type": "message", "content": [{ "type": "refusal", "refusal": "Not doing that." }] }]
         });
-        let policy = Policy { endpoint: Endpoint::Responses, search: true };
+        let policy = allowing();
         assert_eq!(extract(&policy, &body.to_string()).unwrap_err(), "Not doing that.");
     }
 
     #[test]
     fn chat_completions_reads_the_first_choice() {
         let body = json!({ "choices": [{ "message": { "content": "  hi  " }, "finish_reason": "stop" }] });
-        let policy = Policy { endpoint: Endpoint::Chat, search: false };
+        let policy = Policy { endpoint: Endpoint::Chat, search: false, media: true };
         assert_eq!(extract(&policy, &body.to_string()).unwrap(), "hi");
     }
 
