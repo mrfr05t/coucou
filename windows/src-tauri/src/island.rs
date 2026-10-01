@@ -31,6 +31,32 @@ pub const WINDOW_LABEL: &str = "island";
 /// Wider than the macOS 6 pt because a click must never be swallowed.
 const HIT_MARGIN: f64 = 14.0;
 
+/// The window, in logical px, for the island's current collapsed state.
+///
+/// The UI scale multiplies this exactly as it multiplies everything the webview
+/// draws: the zoom lives on the document, so a 1.5× island needs a 1.5× window
+/// or its own text would be clipped by the frame it grew into. Everything
+/// downstream is unchanged, because this is still one pair of logical numbers —
+/// the monitor factor is applied afterwards, as it always was.
+pub fn panel_size(collapsed: bool, ui_scale: f64) -> (f64, f64) {
+    let ui = if ui_scale.is_finite() && ui_scale > 0.0 { ui_scale } else { 1.0 };
+    if collapsed {
+        (STRIP_W * ui, STRIP_H * ui)
+    } else {
+        (PANEL_W * ui, PANEL_H * ui)
+    }
+}
+
+/// The scale the front end is drawing at. Read from the shared settings rather
+/// than passed in, because placement is called from places that otherwise have
+/// no business knowing about it. A poisoned lock is not a reason to fail a
+/// placement: 1.0 is the size everything still works at.
+fn ui_scale(app: &AppHandle) -> f64 {
+    app.try_state::<crate::Shared>()
+        .and_then(|shared| shared.settings.lock().ok().map(|guard| guard.ui_scale))
+        .unwrap_or(1.0)
+}
+
 #[derive(Serialize, Clone)]
 pub struct CursorPayload {
     pub x: f64,
@@ -187,7 +213,7 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let mp = *m.position();
     let ms = *m.size();
 
-    let (lw, lh) = if collapsed { (STRIP_W, STRIP_H) } else { (PANEL_W, PANEL_H) };
+    let (lw, lh) = panel_size(collapsed, ui_scale(app));
     let pw = (lw * scale).round().max(1.0) as u32;
     let ph = (lh * scale).round().max(1.0) as u32;
     let x = mp.x + (ms.width as i32 - pw as i32) / 2;
@@ -313,7 +339,7 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                 let y = (cy - origin.y as f64) / scale;
                 let size = match win.inner_size() {
                     Ok(s) => (s.width as f64 / scale, s.height as f64 / scale),
-                    Err(_) => (PANEL_W, PANEL_H),
+                    Err(_) => panel_size(false, ui_scale(&app)),
                 };
                 if (x - last.0).abs() < 1.0 && (y - last.1).abs() < 1.0 {
                     continue;
@@ -414,5 +440,38 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
 pub fn set_ignore_cursor(app: &AppHandle, ignore: bool) {
     if let Some(win) = window(app) {
         let _ = win.set_ignore_cursor_events(ignore);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn at_one_the_window_is_exactly_what_it_always_been() {
+        assert_eq!(panel_size(false, 1.0), (PANEL_W, PANEL_H));
+        assert_eq!(panel_size(true, 1.0), (STRIP_W, STRIP_H));
+    }
+
+    #[test]
+    fn the_window_grows_by_the_same_factor_as_the_drawing() {
+        // The zoom grows the island's contents, so the frame around them has
+        // to grow by the same amount or the island is clipped by its window.
+        assert_eq!(panel_size(false, 1.5), (1080.0, 480.0));
+        assert_eq!(panel_size(false, 2.0), (1440.0, 640.0));
+    }
+
+    #[test]
+    fn the_wake_strip_stays_a_strip_at_any_scale() {
+        let (_, h) = panel_size(true, 2.0);
+        assert_eq!(h, STRIP_H * 2.0);
+        assert!(h < 40.0, "a hairline, not a bar: {h}");
+    }
+
+    #[test]
+    fn a_nonsense_scale_falls_back_to_the_designed_size() {
+        for bad in [0.0, -3.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(panel_size(false, bad), (PANEL_W, PANEL_H), "{bad} should not reach geometry");
+        }
     }
 }
