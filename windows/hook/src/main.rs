@@ -1,13 +1,13 @@
 //! coucou-hook — the relay Claude Code runs on every hook event.
 //!
 //! Reads the hook JSON on stdin, adds a little terminal context, and hands it to
-//! Coucou over the named pipe `\\.\pipe\coucou-<sid>`.
+//! Coucou over the relay socket.
 //!
 //! Hard rule (docs/CLAUDE.md): **never block Claude Code.**
-//! * If the pipe does not exist — Coucou is closed — we exit 0 immediately with
-//!   nothing on stdout, and the session carries on untouched.
-//! * Every step runs under a deadline enforced by the main thread, so a pipe that
-//!   accepts the connection and then stops reading cannot wedge the session
+//! * If the socket does not exist — Coucou is closed — we exit 0 immediately
+//!   with nothing on stdout, and the session carries on untouched.
+//! * Every step runs under a deadline enforced by the main thread, so a server
+//!   that accepts the connection and then stops reading cannot wedge the session
 //!   either: we abandon the worker and exit.
 //! * Only `PermissionRequest` waits for an answer, because approving from the
 //!   island is the whole point. No answer means empty stdout, and Claude Code
@@ -17,9 +17,15 @@
 
 use std::io::{Read, Write};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 /// Budget for getting a pipe connection. Beyond this Claude Code wins, always.
+/// Unix needs no such budget: a connect there is one kernel call that either
+/// finds a listener or refuses, and spending 300 ms discovering that Coucou is
+/// closed is exactly what the never-block rule forbids.
+#[cfg(windows)]
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 /// Whole-run budget for an event nobody waits on: connect and write, no more.
 const FIRE_AND_FORGET_BUDGET: Duration = Duration::from_secs(2);
@@ -27,7 +33,10 @@ const FIRE_AND_FORGET_BUDGET: Duration = Duration::from_secs(2);
 const DECISION_BUDGET: Duration = Duration::from_secs(110);
 
 /// `ERROR_PIPE_BUSY` — every instance is serving someone else right now. This is
-/// the one error worth retrying: the server exists and a slot will free up.
+/// the one error worth retrying on Windows: the server exists and a slot will
+/// free up. Unix has no equivalent; a listening socket either accepts or it
+/// isn't there.
+#[cfg(windows)]
 const ERROR_PIPE_BUSY: i32 = 231;
 
 /// Fields that are pointless to forward and can be enormous (a whole file read,
@@ -37,20 +46,54 @@ const DROPPED_FIELDS: &[&str] = &["tool_response", "transcript_path"];
 /// less than this anyway.
 const MAX_FIELD_LEN: usize = 2_000;
 
+#[cfg(windows)]
 mod win;
+#[cfg(unix)]
+mod unix;
 
-/// `\\.\pipe\coucou-<sid>`. The SID keeps two accounts on the same machine from
-/// ever meeting on the same pipe; the name falls back to the user name only if
-/// the SID cannot be read at all, which should not happen.
+/// The transport: a named pipe on Windows, a unix socket on Linux. Both
+/// implement `Read + Write`, so everything below here is platform-free — which
+/// is the point, since the wire protocol must never drift between the two.
+#[cfg(windows)]
+type Conn = std::fs::File;
+#[cfg(unix)]
+type Conn = std::os::unix::net::UnixStream;
+
+/// `\\.\pipe\coucou-<sid>` on Windows. The SID keeps two accounts on the same
+/// machine from ever meeting on the same pipe; the name falls back to the user
+/// name only if the SID cannot be read at all, which should not happen.
+#[cfg(windows)]
 fn pipe_path() -> String {
     let key = win::current_user_sid()
         .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_else(|_| "user".into()));
     format!(r"\\.\pipe\coucou-{key}")
 }
 
-/// Opens the pipe. Retries only while the server is busy: any other error means
-/// there is nothing to talk to, and waiting would only delay Claude Code.
-fn connect() -> Option<std::fs::File> {
+/// `$XDG_RUNTIME_DIR/coucou.sock`, falling back to `/tmp/coucou-<uid>.sock`.
+///
+/// `$XDG_RUNTIME_DIR` is the right home: the OS creates it mode 0700 for this
+/// uid, it is guaranteed writable, it is on tmpfs so it vanishes with the
+/// session, and it is where every other per-session socket already lives. The
+/// fallback keeps us working on a machine that never set the variable (a bare
+/// ssh session, say) without ever landing in a world-writable directory under a
+/// predictable name — the uid suffix is what stops that from being a denial of
+/// service by whoever fills /tmp first.
+#[cfg(unix)]
+fn pipe_path() -> String {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return std::path::PathBuf::from(dir)
+            .join("coucou.sock")
+            .to_string_lossy()
+            .into_owned();
+    }
+    let uid = unix::current_uid().unwrap_or(0);
+    format!("/tmp/coucou-{uid}.sock")
+}
+
+/// Opens the connection. Retries only while the server is busy: any other error
+/// means there is nothing to talk to, and waiting would only delay Claude Code.
+#[cfg(windows)]
+fn connect() -> Option<Conn> {
     use std::os::windows::io::AsRawHandle;
     let path = pipe_path();
     let deadline = Instant::now() + CONNECT_TIMEOUT;
@@ -69,6 +112,27 @@ fn connect() -> Option<std::fs::File> {
             }
         }
     }
+}
+
+/// Opens the socket.
+///
+/// Deliberately a single attempt with no retry loop: unlike the pipe, Unix
+/// domain sockets already give the right answer immediately. `ENOENT` means
+/// there is no socket file, `ECONNREFUSED` means a file left behind by a
+/// crashed run — and in *both* cases the honest reply is "Coucou is not
+/// running, say nothing and leave". Retrying for 300 ms the way the pipe does
+/// would mean every hook event after a crash paid the full budget before doing
+/// nothing, which is exactly what the never-block rule forbids.
+///
+/// The one case a retry would help — the server having bound but not yet
+/// listened — is a few microseconds wide and is covered by the caller's budget
+/// rather than by spinning here.
+#[cfg(unix)]
+fn connect() -> Option<Conn> {
+    let path = pipe_path();
+    let stream = std::os::unix::net::UnixStream::connect(&path).ok()?;
+    // Somebody else's server on our path gets nothing from us.
+    unix::peer_is_same_user(&stream).then_some(stream)
 }
 
 fn main() {

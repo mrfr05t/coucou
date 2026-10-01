@@ -15,6 +15,12 @@ Approve Claude Code permissions, watch your session work, drop a file, chat with
 
 </div>
 
+> **Linux:** this same tree also builds and runs on Linux (X11/XWayland).
+> Everything platform-specific lives behind a `platform` module in
+> `src-tauri/src/`, so this README stays the Windows story — the Linux port,
+> its measurements and its open items are in
+> [`../docs/LINUX-PORT.md`](../docs/LINUX-PORT.md).
+
 <img src="screenshots/greeting.png" width="640" alt="Mochi waving hello at launch">
 
 ---

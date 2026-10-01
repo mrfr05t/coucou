@@ -1,18 +1,12 @@
-// Small append-only log at %LOCALAPPDATA%\Coucou\coucou.log — the Windows
+// Small append-only log at <local_dir>/coucou.log — the Linux/Windows
 // equivalent of nbLog() in HookServer.swift. Nothing leaves the machine.
 
 use std::io::Write;
 
-use windows::Win32::System::SystemInformation::GetLocalTime;
-
-use crate::settings;
+use crate::{settings, stamp};
 
 pub fn line(message: impl AsRef<str>) {
-    let t = unsafe { GetLocalTime() };
-    let stamp = format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
-    );
+    let ts = stamp::log_stamp();
     let dir = settings::local_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -23,6 +17,6 @@ pub fn line(message: impl AsRef<str>) {
         let _ = std::fs::remove_file(&path);
     }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{stamp} {}", message.as_ref());
+        let _ = writeln!(file, "{ts} {}", message.as_ref());
     }
 }

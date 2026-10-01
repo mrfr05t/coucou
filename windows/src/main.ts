@@ -25,6 +25,15 @@ async function main() {
 
   await onEvent<{ x: number; y: number }>("cursor", ({ x, y }) => island.onCursor(x, y));
 
+  // No global cursor query on this platform, so nothing streams `cursor`
+  // events: fall back to the webview's own mousemove, which is what the plain
+  // browser does. It only reports a position while the pointer is inside the
+  // window, so on a Wayland session the island cannot see a cursor approaching
+  // from outside — see docs/LINUX-PORT.md § "Degradations".
+  if (boot?.pointerSource === "dom") {
+    window.addEventListener("mousemove", (e) => island.onCursor(e.clientX, e.clientY));
+  }
+
   /** Pause has to reach Rust too, or the pollers keep calling out. */
   const setPaused = (on: boolean) => {
     if (State.paused === on) return;

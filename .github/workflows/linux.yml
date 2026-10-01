@@ -1,0 +1,147 @@
+name: Linux
+
+# Builds the Linux app and publishes the deb + AppImage.
+# The macOS workflows are untouched.
+
+# Unlike windows.yml, this also runs on pushes and PRs. windows.yml has shipped
+# for a while and its tag trigger is enough to keep it honest; this workflow has
+# never executed on a runner, and a tag is the one thing nobody pushes by
+# accident — so until it has run green on `main` there is no "CI green on a
+# clean runner" claim to make. The version tripwire and the publish step are
+# both gated on the tag, so branch runs build and upload an artifact only.
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'linux-v*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Publishing is off until a Linux release has been checked on a clean machine.
+# Tags still build, so the port cannot rot silently. Flip to 'true' once the
+# .deb and the AppImage have both been installed and run for real — and read
+# the --latest note in windows.yml before touching the release itself, or a
+# Linux tag will hand "Latest" to the wrong platform.
+env:
+  PUBLISH: 'false'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04   # pinned: the port was verified on 26.04, not here
+    defaults:
+      run:
+        working-directory: windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Tauri Linux prerequisites, plus squashfs-tools: appimagetool shells
+      # out to mksquashfs, and without it the AppImage bundle step fails after
+      # everything else has already compiled.
+      - name: Install Tauri build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            libxdo-dev \
+            pkg-config \
+            build-essential \
+            xdg-utils \
+            squashfs-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: windows/package-lock.json
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            windows/target
+          key: linux-cargo-${{ hashFiles('windows/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Same tripwire as windows.yml: three files carry the version and drift
+      # silently. A `linux-v0.1.1` that ships a 0.1.0 is filed against the
+      # wrong build.
+      - name: Check the tag and every version agree
+        if: startsWith(github.ref, 'refs/tags/linux-v')
+        run: |
+          tag="${GITHUB_REF_NAME#linux-v}"
+          conf=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          pkg=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
+          cargo=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "tag=$tag tauri.conf=$conf package.json=$pkg Cargo.toml=$cargo"
+          bad=()
+          [ "$tag"    = "$conf" ] || bad+=("tauri.conf.json says $conf")
+          [ "$tag"    = "$pkg"  ] || bad+=("package.json says $pkg")
+          [ "$tag"    = "$cargo" ] || bad+=("Cargo.toml says $cargo")
+          if [ ${#bad[@]} -gt 0 ]; then
+            echo "tag says $tag but ${bad[*]}"
+            exit 1
+          fi
+
+      # `npm run build` (run by tauri as beforeBuildCommand) builds coucou-hook
+      # first, which tauri.linux.conf.json then bundles as a resource. `pack`
+      # copies the deb and the AppImage out of target/ under their shipping
+      # names. tauri.linux.conf.json is merged in automatically on Linux — no
+      # --config flag, exactly as windows.yml needs none for the .exe.
+      - name: Build and pack
+        id: pack
+        run: |
+          npm run pack
+          version=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          ls -l release
+
+      # Always uploaded, even if a later step fails: on a runner you cannot
+      # inspect, the files are the only evidence of what the build produced.
+      # (It cannot rescue a failed *build* — there is nothing to upload then —
+      # but `if-no-files-found: warn` keeps that from turning into a second
+      # error that buries the first one.)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Coucou-Linux
+          if-no-files-found: warn
+          path: |
+            windows/release/*.deb
+            windows/release/*.AppImage
+
+      - name: Publish the release
+        if: env.PUBLISH == 'true' && startsWith(github.ref, 'refs/tags/linux-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.pack.outputs.version }}"
+          notes="Coucou for Linux $v — Mochi at the top of your screen.
+
+          Install the \`.deb\` with \`sudo apt install ./Coucou-Linux-$v.deb\`, or
+          make the AppImage executable and run it. Neither is signed yet."
+          # --latest=false is the same constraint windows.yml documents: the
+          # macOS `v*` releases own the "Latest" slot, and the website's
+          # Download for Mac button points at /releases/latest.
+          gh release create "$GITHUB_REF_NAME" \
+            "release/Coucou-Linux-$v.deb" \
+            "release/Coucou-Linux-$v.AppImage" \
+            --title "Coucou for Linux $v" \
+            --notes "$notes" \
+            --latest=false

@@ -47,24 +47,52 @@ impl Default for Settings {
     }
 }
 
-/// %APPDATA%\Coucou
+/// Where `settings.json` lives.
+///
+/// `%APPDATA%\Coucou` on Windows, `$XDG_CONFIG_HOME/Coucou` (defaulting to
+/// `~/.config/Coucou`) on Linux. Read straight from the environment rather than
+/// through a `dirs` crate, matching how the Windows build does it and keeping
+/// the dependency list honest. The directory keeps the name `Coucou` on both so
+/// the settings window can talk about one path.
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("Coucou")
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    base.unwrap_or_else(|| PathBuf::from(".")).join("Coucou")
 }
 
-/// %LOCALAPPDATA%\Coucou — where coucou-hook.exe and the log live.
+/// Where the hook binary, the log and the file inbox live.
+///
+/// `%LOCALAPPDATA%\Coucou` on Windows, `$XDG_STATE_HOME/Coucou` (defaulting to
+/// `~/.local/state/Coucou`) on Linux — the state directory rather than the
+/// config directory, because none of these three are things a user edits.
 pub fn local_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("Coucou")
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+    base.unwrap_or_else(|| PathBuf::from(".")).join("Coucou")
 }
 
+/// `coucou-hook.exe` on Windows, `coucou-hook` on Linux. Claude Code runs
+/// whatever this returns through a shell, so it must be the real path.
 pub fn hook_exe_path() -> PathBuf {
-    local_dir().join("bin").join("coucou-hook.exe")
+    local_dir().join("bin").join(hook_exe_name())
+}
+
+/// Just the file name, for searching candidate locations and for the log
+/// messages that tell a user where we looked.
+pub fn hook_exe_name() -> &'static str {
+    #[cfg(windows)]
+    let name = "coucou-hook.exe";
+    #[cfg(not(windows))]
+    let name = "coucou-hook";
+    name
 }
 
 fn settings_path() -> PathBuf {

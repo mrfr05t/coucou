@@ -21,6 +21,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Platform stores are target-gated on purpose. keyring falls back to an
+# in-memory *mock* credential store when no store feature applies to the
+# platform it is built for, so an unconditional `windows-native` would compile
+# happily on Linux and silently lose every API key on the next launch.
+[target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 windows = { version = "0.61", features = [
   "Win32_Foundation",
@@ -32,3 +38,30 @@ windows = { version = "0.61", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The store, not just "some store". keyring picks its default with a cfg
+# cascade (keyring 3.6.3/src/lib.rs): `linux-native` alone selects the **kernel
+# keyring** — `keyutils.rs` uses `KeyRingIdentifier::Session`, which is destroyed
+# at logout, so an API key saved there is gone next morning. Only the
+# secret-service feature selects `org.freedesktop.secrets` (gnome-keyring /
+# KWallet), which is the Linux answer to Keychain and Credential Manager: on
+# disk, in the user's keyring app, surviving reboots. Without *some* feature
+# keyring mocks and `secrets::set` would return Ok while storing nothing.
+# `sync-secret-service` is the synchronous D-Bus client, matching the sync
+# `keyring::Entry` calls in `secrets.rs`.
+keyring = { version = "3", features = ["sync-secret-service"] }
+# Replaces GetCursorPos + GetAsyncKeyState: XQueryPointer hands back the root
+# position and the button mask in one round trip. Pure Rust, so no libx11-dev
+# is needed to build it. `shape` is what gives the island its input region
+# (x11rb gates every extension behind its own feature).
+x11rb = { version = "0.13", features = ["shape"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# `pipe.rs` gates on plain `cfg(unix)`, so the dep has to match that gate
+# exactly — a `target_os = "linux"` dep and a `cfg(unix)` use is the kind of
+# mismatch that only shows up on the one platform nobody builds locally.
+[target.'cfg(unix)'.dependencies]
+# SO_PEERCRED and EADDRINUSE have no std binding. One syscall each: once per
+# accepted connection, once per launch.
+libc = "0.2"

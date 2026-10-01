@@ -21,3 +21,9 @@ windows = { version = "0.61", features = [
   "Win32_System_Pipes",
   "Win32_System_Threading",
 ] }
+
+# `SO_PEERCRED` has no std binding, and this is the one place the relay has to
+# ask a question the kernel answers: is the process on the other end of this
+# socket the same user we are?
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

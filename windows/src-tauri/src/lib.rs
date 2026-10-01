@@ -1,4 +1,9 @@
-// Coucou for Windows — app wiring and the commands the island calls.
+// Coucou — app wiring and the commands the island calls.
+//
+// The Windows build and the Linux build share every line here except the four
+// places that reach for a Win32-only primitive: launching a helper without a
+// console window, opening a URL, finding a launcher on PATH, and knowing which
+// user we are. Those are cfg'd at the point of use rather than forked.
 
 mod claude;
 mod files;
@@ -6,12 +11,16 @@ mod hooks;
 mod integrations;
 mod island;
 mod log;
+mod platform;
 mod pipe;
 mod secrets;
 mod settings;
+mod stamp;
 mod tray;
+#[cfg(windows)]
 mod win_user;
 
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -28,8 +37,27 @@ use island::{PollGate, ScreenInfo};
 use pipe::Pending;
 use settings::Settings;
 
-/// Keeps spawned helpers from flashing a console window.
+/// Keeps spawned helpers from flashing a console window. Windows-only: on
+/// Linux there is no console to flash, so the helper is spawned plainly.
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Spawns `cmd` without flashing a console on Windows, and plainly elsewhere.
+///
+/// Both branches return the same `io::Result`, so callers keep one `if` instead
+/// of carrying a cfg on the surrounding expression — which is exactly the kind
+/// of thing that silently rots when only one platform is ever built.
+fn spawn_helper(cmd: &mut Command) -> std::io::Result<()> {
+    // `let` bindings rather than bare `#[cfg]` blocks: a block sitting in
+    // statement position has to be `()`, so a block that *is* the result would
+    // fail to compile on exactly one of the two platforms — the one nobody
+    // builds locally.
+    #[cfg(windows)]
+    let result = cmd.creation_flags(CREATE_NO_WINDOW).spawn().map(|_| ());
+    #[cfg(not(windows))]
+    let result = cmd.spawn().map(|_| ());
+    result
+}
 
 pub struct Shared {
     pub settings: Mutex<Settings>,
@@ -43,10 +71,24 @@ pub struct BootInfo {
     screen: ScreenInfo,
     version: String,
     hook_path: String,
+    /// "windows" | "linux" — the front end picks its wording and its pointer
+    /// source from this, so no platform string is hard-coded in TypeScript.
+    platform: String,
+    /// "poll" when Rust streams `cursor` events at 60 Hz, "dom" when the webview
+    /// has to derive the pointer from its own DOM events (no global cursor query).
+    pointer_source: String,
 }
 
 #[tauri::command]
 fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
+    // The first thing the webview does. If this line is missing from the log,
+    // the front end never ran — every other symptom (no island rect, no
+    // collapse, no wake) follows from that one fact.
+    log::line(format!(
+        "front end booted — platform={} pointer_source={}",
+        platform::PLATFORM,
+        platform::pointer_source()
+    ));
     let mut settings = shared.settings.lock().unwrap().clone();
     // The real state of ~/.claude/settings.json wins over whatever we stored.
     settings.hooks_installed = hooks::status().installed;
@@ -56,6 +98,8 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
         screen,
         version: env!("CARGO_PKG_VERSION").to_string(),
         hook_path: settings::hook_exe_path().to_string_lossy().to_string(),
+        platform: platform::PLATFORM.to_string(),
+        pointer_source: platform::pointer_source().to_string(),
     }
 }
 
@@ -92,23 +136,33 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
 fn set_collapsed(app: AppHandle, shared: State<Shared>, collapsed: bool) {
     let pref = shared.settings.lock().unwrap().screen.clone();
     shared.gate.collapsed.store(collapsed, Ordering::Relaxed);
+    crate::log::line(format!(
+        "{} — cursor poll {}",
+        if collapsed { "island hidden: shrink to the wake strip" } else { "island shown: full panel" },
+        if collapsed { "parked" } else { "running" },
+    ));
     island::apply_geometry(&app, &pref, collapsed);
-    // The wake strip must always take the mouse, and a resize invalidates the flag.
-    island::set_ignore_cursor(&app, false);
-    shared.gate.forget_ignore_state();
+    // apply_geometry re-asserted the island's input shape; where the shape is
+    // cursor-driven instead, this is the one place the flag is handed back —
+    // the strip must take the mouse, and a resize invalidates the flag.
+    if !platform::shape_follows_rect() {
+        island::set_ignore_cursor(&app, false);
+        shared.gate.forget_ignore_state();
+    }
     shared.gate.set_active(!collapsed);
 }
 
-/// The front end pushes the island shape; Rust decides click-through from it.
+/// The front end pushes the island shape; the window's input region follows it.
 #[tauri::command]
-fn set_island_rect(shared: State<Shared>, x: f64, y: f64, width: f64, height: f64) {
+fn set_island_rect(app: AppHandle, shared: State<Shared>, x: f64, y: f64, width: f64, height: f64) {
     shared.gate.set_rect(island::IslandRect { x, y, w: width, h: height });
+    island::sync_input_shape(&app, shared.gate.collapsed.load(Ordering::Relaxed));
 }
 
 #[tauri::command]
 fn focus_window(app: AppHandle, focused: bool) {
     let Some(win) = island::window(&app) else { return };
-    island::set_activating(&win, focused);
+    platform::set_activating(&win, focused);
     if focused {
         let _ = win.set_focus();
     }
@@ -126,14 +180,21 @@ fn open_url(url: String) {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return;
     }
-    let _ = Command::new("rundll32.exe")
-        .args(["url.dll,FileProtocolHandler", &url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+    #[cfg(windows)]
+    {
+        let _ = Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", &url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = spawn_helper(Command::new("xdg-open").arg(&url));
+    }
 }
 
 /// "Open terminal" opens the working folder in VS Code when `code` is on PATH,
-/// and falls back to Explorer otherwise.
+/// and falls back to Explorer (Windows) / the desktop opener (Linux) otherwise.
 #[tauri::command]
 fn open_in_vscode(path: Option<String>) -> bool {
     // No `cmd /C` anywhere near this. The path is a project folder chosen by
@@ -145,19 +206,24 @@ fn open_in_vscode(path: Option<String>) -> bool {
         if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
             cmd.arg(p);
         }
-        if cmd.creation_flags(CREATE_NO_WINDOW).spawn().is_ok() {
+        if spawn_helper(&mut cmd).is_ok() {
             return true;
         }
     }
     if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
+        #[cfg(windows)]
         let _ = Command::new("explorer").arg(p).spawn();
+        #[cfg(not(windows))]
+        let _ = spawn_helper(Command::new("xdg-open").arg(p));
     }
     false
 }
 
-/// Our own `where`: walks %PATH% against %PATHEXT%, no shell involved.
+/// Our own `where`: walks %PATH% against %PATHEXT% on Windows, and $PATH
+/// against the executable bit on Linux. No shell involved on either platform.
 /// Rust quotes arguments correctly for `.cmd`/`.bat` targets since 1.77, so
 /// spawning `code.cmd` directly is safe.
+#[cfg(windows)]
 fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
     let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
     let dirs = std::env::var_os("PATH")?;
@@ -165,6 +231,23 @@ fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
         for ext in exts.split(';').filter(|e| !e.is_empty()) {
             let candidate = dir.join(format!("{stem}{}", ext.to_lowercase()));
             if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Linux has no PATHEXT and no `.cmd` shims: the file either exists in a PATH
+/// directory and is executable, or it is not a match.
+#[cfg(not(windows))]
+fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dirs = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&dirs) {
+        let candidate = dir.join(stem);
+        if let Ok(meta) = candidate.metadata() {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
                 return Some(candidate);
             }
         }
@@ -366,6 +449,17 @@ fn open_settings_window(app: AppHandle) {
 }
 
 pub fn run() {
+    // Must come first: GTK reads GDK_BACKEND when it initializes, and Tauri
+    // initializes GTK somewhere inside Builder::build(). Deciding late means the
+    // Wayland backend is already in use and `set_position` has silently become
+    // a no-op.
+    if !platform::prefer_x11() {
+        log::line(
+            "no X display reachable — running degraded: pointer events come from the \
+             webview, the island cannot place itself at the top of the screen",
+        );
+    }
+
     let loaded = settings::load();
     let gate = Arc::new(PollGate::new());
 
@@ -415,7 +509,7 @@ pub fn run() {
             create_settings_window(&handle);
 
             if let Some(win) = island::window(&handle) {
-                island::make_non_activating(&win);
+                platform::make_non_activating(&win);
                 island::apply_geometry(&handle, &loaded.screen, false);
                 let _ = win.show();
             }

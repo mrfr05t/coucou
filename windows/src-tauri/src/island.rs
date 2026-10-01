@@ -4,6 +4,10 @@
 // There is no notch on a PC, so the island is a black shape drawn at the top
 // centre of the main display inside a borderless, transparent, always-on-top
 // window that never takes focus.
+//
+// Everything OS-specific — cursor query, button state, focus, drag unblocking —
+// is reached through `crate::platform`. This file is the logic that is the same
+// on every platform.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -12,16 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, WebviewWindow};
 
-use windows::Win32::Foundation::{HWND, POINT};
-use windows::core::BOOL;
-use windows::Win32::Foundation::LPARAM;
-use windows::Win32::System::Ole::RevokeDragDrop;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW,
-};
+use crate::platform;
 
 /// Logical size of the full window — the largest island view, like the macOS panel.
 pub const PANEL_W: f64 = 720.0;
@@ -70,7 +65,13 @@ pub struct PollGate {
     pub rect: Mutex<IslandRect>,
     /// Mirrors the window flag so we only call into Win32 when it changes.
     ignoring: AtomicBool,
+    /// Last input region actually handed to the platform, so a shape that has
+    /// not changed costs neither a request nor a log line.
+    last_shape: Mutex<Option<Shape>>,
 }
+
+/// What `sync_input_shape` last applied, in window-logical coordinates.
+type Shape = (bool, i64, i64, i64, i64);
 
 impl PollGate {
     pub fn new() -> Self {
@@ -80,11 +81,27 @@ impl PollGate {
             collapsed: AtomicBool::new(true),
             rect: Mutex::new(IslandRect::default()),
             ignoring: AtomicBool::new(false),
+            last_shape: Mutex::new(None),
         }
     }
 
     pub fn set_rect(&self, rect: IslandRect) {
-        *self.rect.lock().unwrap() = rect;
+        let mut guard = self.rect.lock().unwrap();
+        let was_blank = guard.w == 0.0 && guard.h == 0.0;
+        let becomes_blank = rect.w == 0.0 && rect.h == 0.0;
+        let size_changed = guard.w != rect.w || guard.h != rect.h;
+        *guard = rect;
+        drop(guard);
+
+        // Only the two edges are logged: the first shape the front end ever
+        // pushes, and the moment it withdraws it. Click-through can never turn
+        // off with no shape, and "it never woke up" is invisible without this.
+        if size_changed && (was_blank || becomes_blank) {
+            crate::log::line(format!(
+                "island rect {w:.0}x{h:.0} at ({x:.0},{y:.0})",
+                w = rect.w, h = rect.h, x = rect.x, y = rect.y
+            ));
+        }
     }
 
     /// Forces the next poll tick to re-apply the flag (after a window resize).
@@ -114,50 +131,9 @@ pub fn window(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window(WINDOW_LABEL)
 }
 
-fn cursor_physical() -> Option<(f64, f64)> {
-    let mut p = POINT::default();
-    unsafe { GetCursorPos(&mut p).ok()? };
-    Some((p.x as f64, p.y as f64))
-}
-
-/// Lets dropped files reach the app again.
-///
-/// wry installs its drop target by walking the webview's child windows **once**,
-/// when the webview is created. WebView2 creates `Chrome_RenderWidgetHostHWND`
-/// later and registers its own target on it; being the innermost window, that one
-/// wins, and since the page has no HTML5 drop handler it refuses everything — the
-/// "no drop" cursor, with nothing reaching Tauri. Revoking it makes OLE fall
-/// through to the target wry registered on the parent widget, which is the one
-/// that feeds Tauri's drag events.
-///
-/// Cheap and idempotent, so it is simply re-run whenever a drag might be starting.
-pub fn unblock_webview_drops(app: &AppHandle) {
-    for label in [WINDOW_LABEL, "settings"] {
-        let Some(win) = app.get_webview_window(label) else { continue };
-        let Some(hwnd) = hwnd_of(&win) else { continue };
-        unsafe {
-            let _ = EnumChildWindows(Some(hwnd), Some(revoke_render_widget), LPARAM(0));
-        }
-    }
-}
-
-unsafe extern "system" fn revoke_render_widget(hwnd: HWND, _: LPARAM) -> BOOL {
-    let mut name = [0u16; 64];
-    let len = unsafe { GetClassNameW(hwnd, &mut name) };
-    if len > 0 {
-        let class = String::from_utf16_lossy(&name[..len as usize]);
-        if class == "Chrome_RenderWidgetHostHWND" {
-            let _ = unsafe { RevokeDragDrop(hwnd) };
-        }
-    }
-    true.into()
-}
-
-/// True while the left mouse button is held — the only signal we get that a
-/// drag might be in flight before it reaches the window.
-fn left_button_down() -> bool {
-    unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
-}
+// Cursor, button state, drag unblocking and focus policy live in
+// `crate::platform` — see `platform/win32.rs` and `platform/x11.rs`. This file
+// only ever asks the seam for an answer.
 
 fn monitor_contains(m: &Monitor, x: f64, y: f64) -> bool {
     let p = m.position();
@@ -172,7 +148,7 @@ fn monitor_contains(m: &Monitor, x: f64, y: f64) -> bool {
 fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
     let monitors = app.available_monitors().ok()?;
     if pref == "cursor" {
-        if let Some((cx, cy)) = cursor_physical() {
+        if let Some((cx, cy)) = platform::cursor_physical() {
             if let Some(m) = monitors.iter().find(|m| monitor_contains(m, cx, cy)) {
                 return Some(m.clone());
             }
@@ -217,43 +193,67 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let x = mp.x + (ms.width as i32 - pw as i32) / 2;
     let y = mp.y;
 
+    // GTK will not shrink a window declared `resizable: false` — `resize` is a
+    // silent no-op there, where Windows' SetWindowPos resizes regardless of
+    // WS_THICKFRAME. So the island has to become resizable before every
+    // placement, and it must *stay* resizable: locking it again makes GTK fall
+    // back to the window's default size (240x6, which GTK itself clamps to 200
+    // high), undoing the very resize we just asked for. Not offering a resize
+    // grip is therefore a Windows-only guarantee — here the size is authoritative
+    // because the island immediately re-asserts it on the next placement.
+    #[cfg(unix)]
+    let _ = win.set_resizable(true);
     let _ = win.set_size(PhysicalSize::new(pw, ph));
     let _ = win.set_position(PhysicalPosition::new(x, y));
     // Moving across displays can rescale the window: re-assert the physical size.
     let _ = win.set_size(PhysicalSize::new(pw, ph));
     let _ = win.set_always_on_top(true);
+    crate::log::line(format!("placed the island: {pw}x{ph} at ({x},{y})"));
+    // A placement is exactly when GTK may re-assert its own input region, so the
+    // island's shape goes back on straight after.
+    sync_input_shape(app, collapsed);
 }
 
-fn hwnd_of(win: &WebviewWindow) -> Option<HWND> {
-    let raw = win.hwnd().ok()?.0 as isize;
-    if raw == 0 {
-        return None;
+/// Hands the window an input region shaped like the island, so it takes the
+/// mouse where it is drawn and nowhere else.
+///
+/// Only meaningful where `platform::shape_follows_rect()` — see
+/// `platform::set_input_rect` for why X11 needs this instead of a cursor-driven
+/// flag. Elsewhere it returns before touching anything.
+///
+/// `collapsed` is passed in rather than read from the gate because at boot the
+/// window has already been sized while the gate still holds its initial value.
+pub fn sync_input_shape(app: &AppHandle, collapsed: bool) {
+    if !platform::shape_follows_rect() {
+        return;
     }
-    Some(HWND(raw as *mut _))
-}
+    let Some(shared) = app.try_state::<crate::Shared>() else { return };
+    let r = *shared.gate.rect.lock().unwrap();
 
-/// WS_EX_NOACTIVATE keeps clicks from stealing focus; WS_EX_TOOLWINDOW keeps the
-/// island out of Alt-Tab.
-pub fn make_non_activating(win: &WebviewWindow) {
-    let Some(hwnd) = hwnd_of(win) else { return };
-    unsafe {
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let want = ex | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
+    // Collapsed: the window *is* the wake strip, so all of it takes the mouse.
+    // Expanded: the island's own rectangle — including a zero height, which is
+    // the island mid-animation and must not swallow a click while invisible.
+    let (key, described) = if collapsed {
+        ((true, 0, 0, 0, 0), "full window (wake strip)".to_string())
+    } else if r.w > 0.0 && r.h > 0.0 {
+        (
+            (false, r.x.round() as i64, r.y.round() as i64, r.w.round() as i64, r.h.round() as i64),
+            format!("{w:.0}x{h:.0} at ({x:.0},{y:.0})", w = r.w, h = r.h, x = r.x, y = r.y),
+        )
+    } else {
+        ((false, 0, 0, 0, 0), "empty — island invisible".to_string())
+    };
+
+    {
+        let mut last = shared.gate.last_shape.lock().unwrap();
+        if *last == Some(key) {
+            return;
+        }
+        *last = Some(key);
     }
-}
-
-/// Temporarily allow activation so a text field inside the island can be typed in.
-pub fn set_activating(win: &WebviewWindow, activating: bool) {
-    let Some(hwnd) = hwnd_of(win) else { return };
-    unsafe {
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let want = if activating {
-            ex & !(WS_EX_NOACTIVATE.0 as isize)
-        } else {
-            ex | WS_EX_NOACTIVATE.0 as isize
-        };
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
+    crate::log::line(format!("input shape: {described}"));
+    if let Some(win) = window(app) {
+        platform::set_input_rect(&win, if collapsed { None } else { Some((r.x, r.y, r.w, r.h)) });
     }
 }
 
@@ -275,6 +275,9 @@ fn current_screen_key(app: &AppHandle) -> Option<(i32, i32, u32, u32, u64)> {
 pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
     std::thread::spawn(move || {
         let mut was_down = false;
+        // On the rect-driven path, whether the cursor was last seen inside the
+        // island — only used to log the transition once.
+        let mut was_inside = false;
         // Remembered across wakes so a display change while hidden is noticed the
         // moment the island comes back.
         let mut last_screen: Option<(i32, i32, u32, u32, u64)> = None;
@@ -305,7 +308,7 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                 let Some(win) = window(&app) else { continue };
                 let Ok(origin) = win.outer_position() else { continue };
                 let scale = win.scale_factor().unwrap_or(1.0);
-                let Some((cx, cy)) = cursor_physical() else { continue };
+                let Some((cx, cy)) = platform::cursor_physical() else { continue };
                 let x = (cx - origin.x as f64) / scale;
                 let y = (cy - origin.y as f64) / scale;
                 let size = match win.inner_size() {
@@ -317,9 +320,8 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                 }
                 last = (x, y);
 
-                // Click-through: the window only takes the mouse over the island
-                // shape. A small entry margin means the flag is already off by the
-                // time a moving cursor reaches a button.
+                // The island shape, with a small entry margin so the decision is
+                // already made by the time a moving cursor reaches a button.
                 let r = *gate.rect.lock().unwrap();
                 let on_island = r.w > 0.0
                     && x >= r.x - HIT_MARGIN
@@ -336,10 +338,10 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                 // the mouse, which also makes the drop zone as forgiving as the Mac's.
                 // A press may be the start of a drag: make sure the drop target is
                 // ours before the file arrives.
-                let down = left_button_down();
+                let down = platform::left_button_down();
                 if down && !was_down {
                     let handle = app.clone();
-                    let _ = app.run_on_main_thread(move || unblock_webview_drops(&handle));
+                    let _ = app.run_on_main_thread(move || platform::unblock_webview_drops(&handle));
                 }
                 was_down = down;
 
@@ -350,8 +352,56 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                     && y <= size.1;
 
                 let accept = on_island || dragging;
-                if gate.ignoring.load(Ordering::Relaxed) == accept {
+
+                if platform::shape_follows_rect() {
+                    // Nothing to flip: `sync_input_shape` already gave the window
+                    // the island's own rectangle, so it takes the mouse wherever
+                    // the island is drawn whether or not the cursor read is
+                    // telling the truth. All the poll can usefully report is that
+                    // read itself — on XWayland it can freeze for minutes while
+                    // the pointer is over surfaces XWayland gets no events for,
+                    // and "the island is unclickable" has exactly one cause
+                    // hiding in that number. Tested against the rectangle the
+                    // window actually uses, margin and all, so the line says
+                    // where the click would really land.
+                    let in_shape = r.w > 0.0
+                        && r.h > 0.0
+                        && x >= r.x
+                        && x <= r.x + r.w
+                        && y >= r.y
+                        && y <= r.y + r.h;
+                    if in_shape != was_inside {
+                        was_inside = in_shape;
+                        if !gate.collapsed.load(Ordering::Relaxed) {
+                            crate::log::line(format!(
+                                "cursor {} island — cursor=({x:.0},{y:.0}) rect=({:.0},{:.0} {w:.0}x{h:.0})",
+                                if in_shape { "inside" } else { "outside" },
+                                r.x, r.y, w = r.w, h = r.h,
+                            ));
+                        }
+                    }
+                } else if
+                    // While the island is hidden, this flag belongs to
+                    // set_collapsed — which sets it and then parks this poll — and
+                    // the cursor is normally nowhere near the island shape. A tick
+                    // already in flight must therefore not recompute it: it would
+                    // flip click-through back on, and with the poll parked nothing
+                    // would ever flip it off again. The wake strip wakes on a DOM
+                    // mouseenter, which click-through swallows, so that state has
+                    // no way back out.
+                    !gate.collapsed.load(Ordering::Relaxed)
+                    && gate.ignoring.load(Ordering::Relaxed) == accept
+                {
                     gate.ignoring.store(!accept, Ordering::Relaxed);
+                    // One line per transition, not per tick: this is the seam
+                    // where cursor space, the island rect and the window flag
+                    // all meet, and on a new platform "it is stuck clicking
+                    // through" has exactly one cause hiding in these numbers.
+                    crate::log::line(format!(
+                        "click-through {} — cursor=({x:.0},{y:.0}) rect=({:.0},{:.0} {w:.0}x{h:.0})",
+                        if accept { "off: window takes the mouse" } else { "on: passes through" },
+                        r.x, r.y, w = r.w, h = r.h,
+                    ));
                     let _ = win.set_ignore_cursor_events(!accept);
                 }
 

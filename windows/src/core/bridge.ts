@@ -26,6 +26,18 @@ export interface BootInfo {
   screen: { x: number; y: number; width: number; height: number; scale: number };
   version: string;
   hookPath: string;
+  /**
+   * `"windows" | "linux"`. Affects wording and the settings window only — no
+   * branch in here should ever care which OS it is running on.
+   */
+  platform: string;
+  /**
+   * `"poll"`: Rust streams window-space `cursor` events at 60 Hz from a global
+   * cursor query. `"dom"`: there is no global query to be had (a Wayland
+   * session), so the webview has to derive the pointer from its own mousemove
+   * events — which only work while the pointer is actually over the window.
+   */
+  pointerSource: "poll" | "dom";
 }
 
 export const Bridge = {
