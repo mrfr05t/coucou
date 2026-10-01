@@ -514,6 +514,9 @@ fn open_settings_window(app: AppHandle) {
 }
 
 pub fn run() {
+    // Same rule as prefer_x11 below: the environment has to be right before GTK
+    // — and with it WebKit's GStreamer — initializes.
+    platform::repair_appimage_gstreamer();
     // Must come first: GTK reads GDK_BACKEND when it initializes, and Tauri
     // initializes GTK somewhere inside Builder::build(). Deciding late means the
     // Wayland backend is already in use and `set_position` has silently become

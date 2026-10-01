@@ -2,6 +2,17 @@
 // The 28 WAVs are the macOS app's own files (see SOUNDS_DIR in vite.config.ts);
 // they are served at /sounds/<name>.wav. Default volume 0.12, slider range 0–0.2,
 // exactly like the Mac player, and several sounds may overlap.
+//
+// Failures here are invisible by design — a missing sound must never break the
+// island — so anything that goes wrong is written to the shared log instead:
+// "no AudioContext", "buffers 0/28" and "context suspended" are three different
+// bugs, and without a line for each they all look the same from outside.
+
+import { Bridge, IS_TAURI } from "./bridge";
+
+function note(message: string) {
+  if (IS_TAURI) void Bridge.log(`sound ${message}`);
+}
 
 export const SOUND_NAMES = [
   "peek", "open", "close", "hover", "blip", "slap", "annoyed", "dizzy", "greet",
@@ -21,30 +32,46 @@ class SoundEngine {
   private buffers = new Map<string, AudioBuffer>();
   private loading: Promise<void> | null = null;
   private idleTimer: number | null = null;
+  private skips = 0;
 
   /** Creates the context and decodes every WAV. Safe to call more than once. */
   preload(): Promise<void> {
     if (this.loading) return this.loading;
     this.loading = (async () => {
       const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!Ctor) return;
-      const ctx = new Ctor();
+      if (!Ctor) {
+        note("this webview has no AudioContext constructor");
+        return;
+      }
+      let ctx: AudioContext;
+      try {
+        ctx = new Ctor();
+      } catch (err) {
+        note(`AudioContext refused to start: ${err}`);
+        return;
+      }
       this.ctx = ctx;
+      note(`context created (${ctx.state})`);
       const master = ctx.createGain();
       master.gain.value = this.volume;
       master.connect(ctx.destination);
       this.master = master;
+      const failed: string[] = [];
       await Promise.all(
         SOUND_NAMES.map(async (name) => {
           try {
-            const res = await fetch(`/sounds/${name}.wav`);
-            if (!res.ok) return;
-            const buf = await ctx.decodeAudioData(await res.arrayBuffer());
-            this.buffers.set(name, buf);
-          } catch {
+            this.buffers.set(name, await this.loadWav(name, ctx));
+          } catch (err) {
             /* a missing sound must never break the island */
+            failed.push(`${name}: ${err}`);
           }
         }),
+      );
+      note(
+        `buffers ${this.buffers.size}/${SOUND_NAMES.length}, context ${ctx.state}` +
+          (failed.length
+            ? ` — failed: ${failed.slice(0, 3).join(", ")}${failed.length > 3 ? ` +${failed.length - 3} more` : ""}`
+            : ""),
       );
     })();
     return this.loading;
@@ -56,7 +83,11 @@ class SoundEngine {
       window.clearTimeout(this.idleTimer);
       this.idleTimer = null;
     }
-    void this.ctx?.resume();
+    const ctx = this.ctx;
+    if (!ctx) return;
+    // A refusal here is the autoplay policy talking: WebKit only honours this
+    // from a real gesture, so the reason is worth having in the log.
+    void ctx.resume().catch((err) => note(`resume rejected: ${err}`));
   }
 
   /**
@@ -89,16 +120,36 @@ class SoundEngine {
     const ctx = this.ctx;
     const master = this.master;
     const buf = this.buffers.get(name);
-    if (!ctx || !master || !buf) return;
+    if (!ctx || !master || !buf) {
+      this.reportSkip(name, !ctx ? "no AudioContext" : !master ? "no mixer" : `no buffer for "${name}"`);
+      return;
+    }
     if (this.idleTimer != null) {
       window.clearTimeout(this.idleTimer);
       this.idleTimer = null;
     }
-    if (ctx.state === "suspended") void ctx.resume();
+    if (ctx.state === "suspended") void ctx.resume().catch((err) => note(`resume rejected: ${err}`));
+    if (ctx.state !== "running") this.reportSkip(name, `context ${ctx.state}`);
     const src = ctx.createBufferSource();
     src.buffer = buf;
     src.connect(master);
     src.start();
+  }
+
+  /**
+   * The WAVs are served at /sounds/<name>.wav — by the dev server in a browser,
+   * and by Tauri's asset protocol in the app.
+   */
+  private async loadWav(name: string, ctx: AudioContext): Promise<AudioBuffer> {
+    const res = await fetch(`/sounds/${name}.wav`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return ctx.decodeAudioData(await res.arrayBuffer());
+  }
+
+  /** First few failures only — after that the line would just be noise. */
+  private reportSkip(name: string, why: string) {
+    if (this.skips++ >= 4) return;
+    note(`can't play "${name}": ${why}`);
   }
 }
 

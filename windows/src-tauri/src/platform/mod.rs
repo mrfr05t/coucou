@@ -109,3 +109,106 @@ pub fn prefer_x11() -> bool {
 pub fn prefer_x11() -> bool {
     imp::prefer_x11()
 }
+
+/// The directories a Linux distribution keeps its GStreamer plugins in — the
+/// multiarch layouts first, then the plain one. Only those that exist are used,
+/// so an AppImage built on one machine keeps working on another.
+#[cfg(all(unix, not(target_os = "macos")))]
+const SYSTEM_GSTREAMER_DIRS: [&str; 5] = [
+    "/usr/lib/x86_64-linux-gnu/gstreamer-1.0",
+    "/usr/lib/aarch64-linux-gnu/gstreamer-1.0",
+    "/usr/lib/i386-linux-gnu/gstreamer-1.0",
+    "/usr/lib64/gstreamer-1.0",
+    "/usr/lib/gstreamer-1.0",
+];
+
+/// The system GStreamer plugin directories `exists` accepts, in the order
+/// GStreamer should try them.
+///
+/// Split out so the choice can be tested without a filesystem and without
+/// touching the process environment.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn system_plugin_dirs(exists: impl Fn(&str) -> bool) -> Vec<String> {
+    SYSTEM_GSTREAMER_DIRS
+        .iter()
+        .filter(|dir| exists(dir))
+        .map(|dir| (*dir).to_string())
+        .collect()
+}
+
+/// Windows has no AppImage and nothing to repair here.
+#[cfg(windows)]
+pub fn repair_appimage_gstreamer() {}
+
+/// Points GStreamer at the system plugins when running from an AppImage.
+///
+/// The AppImage bundles GStreamer's core libraries but none of its plugins, and
+/// its launcher sets `GST_PLUGIN_SYSTEM_PATH_1_0` to `$APPDIR/usr/lib/gstreamer-1.0`
+/// — a directory that does not exist. That *replaces* the path GStreamer was
+/// built with, so it registers no dynamic plugins at all: no `appsrc`, no
+/// `decodebin`, no audio sink. WebKit's answer to a missing sink is an
+/// `AudioContext` that never starts plus a `decodeAudioData` promise that never
+/// settles — a silent island, with nothing in the log to say why.
+///
+/// `GST_PLUGIN_PATH_1_0` is additive, so the system directories go there and
+/// anything an AppImage does ship of its own keeps working.
+///
+/// Must be called before Tauri builds anything: the web process inherits this
+/// environment, and it is where GStreamer initializes.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn repair_appimage_gstreamer() {
+    let Some(appdir) = std::env::var_os("APPDIR") else {
+        return; // Not an AppImage.
+    };
+    if std::path::Path::new(&appdir)
+        .join("usr/lib/gstreamer-1.0")
+        .is_dir()
+    {
+        // This AppImage brought its own plugins; the paths are its business.
+        return;
+    }
+    let mut dirs = system_plugin_dirs(|dir| std::path::Path::new(dir).is_dir());
+    if let Some(existing) = std::env::var_os("GST_PLUGIN_PATH_1_0") {
+        if !existing.is_empty() {
+            dirs.push(existing.to_string_lossy().into_owned());
+        }
+    }
+    if dirs.is_empty() {
+        crate::log::line(
+            "AppImage: no GStreamer plugin directory found — sound will not play".to_string(),
+        );
+        return;
+    }
+    crate::log::line(format!(
+        "AppImage: pointing GStreamer at the system plugins ({})",
+        dirs.join(":")
+    ));
+    std::env::set_var("GST_PLUGIN_PATH_1_0", dirs.join(":"));
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_plugin_directories_that_exist_are_offered() {
+        // Distributions disagree about where they put these, so a directory
+        // that is not there has to be skipped rather than pointed at — pointing
+        // GStreamer at a path that does not exist is the whole bug this fixes.
+        assert_eq!(
+            system_plugin_dirs(|dir| dir == "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"),
+            vec!["/usr/lib/x86_64-linux-gnu/gstreamer-1.0".to_string()]
+        );
+        assert_eq!(
+            system_plugin_dirs(|dir| dir.starts_with("/usr/lib6")),
+            vec!["/usr/lib64/gstreamer-1.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_plugin_directory_offers_nothing() {
+        // The caller turns this into a log line instead of an empty path, which
+        // would otherwise look like "no plugins wanted" to GStreamer.
+        assert!(system_plugin_dirs(|_| false).is_empty());
+    }
+}

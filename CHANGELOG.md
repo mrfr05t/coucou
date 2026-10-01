@@ -80,10 +80,26 @@ file-by-file change list, verification checklist and evidence log in
   supported … mmproj`. The request is retried once without the media, and the
   model is told `[shot.png was attached, but this endpoint cannot read images]`
   instead of the turn being lost.
+- **The AppImage was silent** — every sound effect, and only in the packaged
+  build: the same binary run straight from `target/release` played all 28. An
+  AppImage bundles GStreamer's core libraries but none of its plugins, and its
+  launcher sets `GST_PLUGIN_SYSTEM_PATH_1_0` to `$APPDIR/usr/lib/gstreamer-1.0`
+  — a directory that does not exist. Because that variable *replaces* the path
+  GStreamer was compiled with rather than adding to it, GStreamer registered no
+  dynamic plugins at all: no `appsrc`, no `decodebin`, no audio sink. WebKit's
+  version of "no audio sink" is an `AudioContext` that never starts plus a
+  `decodeAudioData` promise that never settles, so the engine hung on the first
+  file and the island was mute. The system plugin directories now go in through
+  the additive `GST_PLUGIN_PATH_1_0`, before Tauri builds anything. The `.deb`
+  uses the system libraries and was never affected.
+- **Sound failures stop being invisible** — the engine writes `context created
+  (suspended)`, `buffers 28/28, context running` and the first few sounds it
+  could not play to the shared log. That is what made the above findable; the
+  old code swallowed all three states as the same silence.
 
 ### Tests
 
-- **35 tests** (32 in the app, 3 in the hook), up from 18 before this fork.
+- **37 tests** (34 in the app, 3 in the hook), up from 18 before this fork.
   New coverage includes three end-to-end tests that run a mock HTTP server and
   exercise the route ladder, the items llama.cpp needs, and the clamping of the
   UI scale — plus the port's geometry and window arithmetic.
