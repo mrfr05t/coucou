@@ -209,6 +209,8 @@ The macOS app is native Swift 6 / SwiftUI / AppKit with **zero third-party depen
 
 Issues and PRs are very welcome — new integrations, new emotes, new sounds, bug fixes. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+What has changed so far is listed in [CHANGELOG.md](CHANGELOG.md); the reasoning behind each entry is in the commit that links to it.
+
 ## Credits
 
 Built by [Louis Raillé](https://louisraille.fr) with Claude Code.
