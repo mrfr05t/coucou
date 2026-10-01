@@ -5,12 +5,14 @@
 // console window, opening a URL, finding a launcher on PATH, and knowing which
 // user we are. Those are cfg'd at the point of use rather than forked.
 
+mod chat;
 mod claude;
 mod files;
 mod hooks;
 mod integrations;
 mod island;
 mod log;
+mod openai;
 mod platform;
 mod pipe;
 mod secrets;
@@ -30,7 +32,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
-use claude::{Chat, ChatContext, ChatReply};
+use chat::{Chat, ChatContext, ChatReply};
 use files::DroppedFile;
 use hooks::{HookPreview, HookStatus};
 use island::{PollGate, ScreenInfo};
@@ -331,8 +333,20 @@ async fn chat_send(
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    // Snapshot the settings: provider, model and base URL have to agree with
+    // each other, and the lock cannot be held across the await.
+    let (is_openai, model, base) = {
+        let s = shared.settings.lock().unwrap();
+        let is_openai = s.provider == "openai";
+        let model = if is_openai { s.openai_model.clone() } else { s.model.clone() };
+        (is_openai, model, s.openai_base_url.clone())
+    };
+
+    if is_openai {
+        openai::send(&chat, &base, &model, query, context).await
+    } else {
+        claude::send(&chat, &model, query, context).await
+    }
 }
 
 #[tauri::command]

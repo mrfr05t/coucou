@@ -171,87 +171,218 @@ function claudeSection(status: HookStatus): HTMLElement {
   return section;
 }
 
-// ── Claude API section ────────────────────────────────────────────────────────
+// ── Chat provider section ─────────────────────────────────────────────────────
 
-const MODELS: [string, string][] = [
+const CLAUDE_MODELS: [string, string][] = [
   ["claude-opus-5", "Claude Opus 5"],
   ["claude-sonnet-5", "Claude Sonnet 5"],
   ["claude-haiku-4-5", "Claude Haiku 4.5"],
 ];
 
-function apiSection(hasKey: boolean): HTMLElement {
-  const dot = statusDot(hasKey);
-  const state = h("span", { class: "hint", text: hasKey ? "Key saved in the Windows Credential Manager." : "No key yet — the chat needs one." });
+const OPENAI_MODELS: [string, string][] = [
+  ["gpt-5", "GPT-5"],
+  ["gpt-5-mini", "GPT-5 Mini"],
+  ["gpt-4.1", "GPT-4.1"],
+  ["gpt-4o", "GPT-4o"],
+];
 
-  const field = h("input", {
-    type: "password",
-    placeholder: hasKey ? "••••••••••••  (stored)" : "sk-ant-...",
-    style: "flex:1 1 auto;min-width:0",
-    autocomplete: "off",
-    spellcheck: "false",
-  }) as HTMLInputElement;
+const PROVIDERS: [string, string][] = [
+  ["claude", "Claude (Anthropic)"],
+  ["openai", "OpenAI-compatible"],
+];
 
-  const saveBtn = h("button", { class: "primary", text: "Save key" });
-  const clearBtn = h("button", { class: "danger", text: "Remove" });
-  const feedback = h("div", {});
+/** The secret the active provider keeps its key under. */
+function keyFor(provider: string): string {
+  return provider === "openai" ? "openai-api-key" : "anthropic-api-key";
+}
 
-  async function refresh() {
-    const present = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
-    dot.style.background = present ? "#22c55e" : "#f4505e";
-    state.textContent = present
-      ? "Key saved in the Windows Credential Manager."
-      : "No key yet — the chat needs one.";
-    field.placeholder = present ? "••••••••••••  (stored)" : "sk-ant-...";
-    clearBtn.style.display = present ? "" : "none";
-  }
+function placeholderFor(provider: string): string {
+  return provider === "openai" ? "sk-…, or your server's key" : "sk-ant-...";
+}
 
-  saveBtn.addEventListener("click", async () => {
-    const value = field.value.trim();
-    if (!value) return;
-    clear(feedback);
-    try {
-      await Bridge.secretSet("anthropic-api-key", value);
-      field.value = "";
-      feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
-      await refresh();
-    } catch (err) {
-      feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
-    }
-  });
+const BASE_URL_HINT =
+  "Bare origins get /v1 added. Web search needs the /responses route; " +
+  "servers without it fall back to plain chat completions, without search.";
 
-  clearBtn.addEventListener("click", async () => {
-    clear(feedback);
-    try {
-      await Bridge.secretClear("anthropic-api-key");
-      feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
-      await refresh();
-    } catch (err) {
-      feedback.append(h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }));
-    }
-  });
-
-  const model = h("select", {}) as HTMLSelectElement;
-  for (const [id, label] of MODELS) model.append(h("option", { value: id, text: label }));
-  if (!MODELS.some(([id]) => id === settings.model)) {
-    model.append(h("option", { value: settings.model, text: settings.model }));
-  }
-  model.value = settings.model;
-  model.addEventListener("change", () => {
-    settings.model = model.value;
-    void save();
-  });
-
-  clearBtn.style.display = hasKey ? "" : "none";
-
-  return h(
+/**
+ * Provider, key, model and — for anything OpenAI-shaped — the base URL.
+ *
+ * The rows are rebuilt whenever the provider changes, because each one is
+ * bound to a different setting and a different secret. The Rust side starts a
+ * fresh conversation on switch as well, so Claude-shaped history is never
+ * handed to another API.
+ */
+async function apiSection(): Promise<HTMLElement> {
+  const body = h("div", { style: "display:flex;flex-direction:column;gap:12px" });
+  const section = h(
     "section",
     {},
-    h("h2", {}, dot, h("span", { text: "Claude" })),
-    state,
-    h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
-    h("div", { class: "row" }, h("label", { text: "Model" }), model),
-    feedback,
+    h("h2", {}, statusDot(false), h("span", { text: "Chat" })),
+    body,
   );
+  const dot = section.querySelector("i")!;
+  const feedback = h("div", {});
+
+  // Refreshed by draw(); read by the base URL row too, because the host in
+  // there is what decides whether a key is needed at all.
+  let hasKey = false;
+  const isOpenai = () => settings.provider === "openai";
+  /** Claude always needs a key; a local OpenAI-shaped server may not. */
+  const ready = () =>
+    hasKey || (isOpenai() && !/api\.openai\.com/.test(settings.openaiBaseUrl));
+  const paintDot = () => {
+    dot.style.background = ready() ? "#22c55e" : "#f4505e";
+  };
+
+  const draw = async () => {
+    const provider = isOpenai() ? "openai" : "claude";
+    hasKey = (await Bridge.secretPresent(keyFor(provider))) ?? false;
+    paintDot();
+
+    const hint = isOpenai()
+      ? hasKey
+        ? "Key saved in the system keyring. Anything that speaks the OpenAI API works — api.openai.com, OpenRouter, Ollama, LM Studio."
+        : "No key stored — fine for a local server like Ollama; api.openai.com needs one."
+      : hasKey
+        ? "Key saved in the system keyring."
+        : "No key yet — the chat needs one.";
+
+    clear(feedback);
+    clear(body);
+    body.append(
+      h("span", { class: "hint", text: hint }),
+      providerRow(),
+      keyRow(provider, hasKey),
+      modelRow(provider),
+    );
+    if (provider === "openai") {
+      body.append(baseUrlRow(), h("span", { class: "hint", text: BASE_URL_HINT }));
+    }
+    body.append(feedback);
+  };
+
+  function providerRow(): HTMLElement {
+    const select = h("select", {}) as HTMLSelectElement;
+    for (const [id, label] of PROVIDERS) select.append(h("option", { value: id, text: label }));
+    select.value = settings.provider === "openai" ? "openai" : "claude";
+    select.addEventListener("change", () => {
+      settings.provider = select.value;
+      void save();
+      void draw();
+    });
+    return h("div", { class: "row" }, h("label", { text: "Provider" }), select);
+  }
+
+  function keyRow(provider: string, present: boolean): HTMLElement {
+    const key = keyFor(provider);
+    const field = h("input", {
+      type: "password",
+      placeholder: present ? "••••••••••••  (stored)" : placeholderFor(provider),
+      style: "flex:1 1 auto;min-width:0",
+      autocomplete: "off",
+      spellcheck: "false",
+    }) as HTMLInputElement;
+
+    const saveBtn = h("button", { class: "primary", text: "Save key" });
+    const clearBtn = h("button", { class: "danger", text: "Remove" });
+    clearBtn.style.display = present ? "" : "none";
+
+    saveBtn.addEventListener("click", async () => {
+      const value = field.value.trim();
+      if (!value) return;
+      clear(feedback);
+      try {
+        await Bridge.secretSet(key, value);
+        field.value = "";
+        feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
+        await draw();
+      } catch (err) {
+        feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
+      }
+    });
+
+    clearBtn.addEventListener("click", async () => {
+      clear(feedback);
+      try {
+        await Bridge.secretClear(key);
+        feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
+        await draw();
+      } catch (err) {
+        feedback.append(
+          h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }),
+        );
+      }
+    });
+
+    return h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn);
+  }
+
+  function modelRow(provider: string): HTMLElement {
+    if (provider === "claude") {
+      const select = h("select", {}) as HTMLSelectElement;
+      for (const [id, label] of CLAUDE_MODELS) {
+        select.append(h("option", { value: id, text: label }));
+      }
+      if (!CLAUDE_MODELS.some(([id]) => id === settings.model)) {
+        select.append(h("option", { value: settings.model, text: settings.model }));
+      }
+      select.value = settings.model;
+      select.addEventListener("change", () => {
+        settings.model = select.value;
+        void save();
+      });
+      return h("div", { class: "row" }, h("label", { text: "Model" }), select);
+    }
+
+    // A compatible server will answer to whatever it is called — llama3.1,
+    // qwen2.5 — so a datalist rather than a fixed list: suggestions plus a
+    // free-text field.
+    const field = h("input", {
+      list: "openai-models",
+      value: settings.openaiModel,
+      style: "flex:1 1 auto;min-width:0",
+      autocomplete: "off",
+      spellcheck: "false",
+    }) as HTMLInputElement;
+    const list = h("datalist", { id: "openai-models" });
+    for (const [id, label] of OPENAI_MODELS) list.append(h("option", { value: id, label }));
+
+    const commit = () => {
+      const value = field.value.trim();
+      if (!value || value === settings.openaiModel) return;
+      settings.openaiModel = value;
+      void save();
+    };
+    field.addEventListener("change", commit);
+    field.addEventListener("blur", commit);
+
+    return h("div", { class: "row" }, h("label", { text: "Model" }), field, list);
+  }
+
+  function baseUrlRow(): HTMLElement {
+    const field = h("input", {
+      value: settings.openaiBaseUrl,
+      placeholder: "https://api.openai.com/v1",
+      style: "flex:1 1 auto;min-width:0",
+      autocomplete: "off",
+      spellcheck: "false",
+    }) as HTMLInputElement;
+
+    const commit = () => {
+      const value = field.value.trim();
+      if (!value || value === settings.openaiBaseUrl) return;
+      settings.openaiBaseUrl = value;
+      void save();
+      paintDot(); // the host decides whether a key is needed
+    };
+    field.addEventListener("change", commit);
+    field.addEventListener("blur", commit);
+
+    return h("div", { class: "row" }, h("label", { text: "Base URL" }), field);
+  }
+
+  await draw();
+  return section;
 }
 
 // ── Integrations section ──────────────────────────────────────────────────────
@@ -429,8 +560,6 @@ async function main() {
     installed: false, settingsPath: "", hookPath: "", hookReady: false,
   };
 
-  const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
-
   const keys = [
     "stripe-api-key", "github-token", "vercel-token",
     "n8n-url", "n8n-api-key", "resend-api-key", "notion-api-key", "calcom-api-key",
@@ -442,7 +571,7 @@ async function main() {
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     claudeSection(status),
-    apiSection(hasKey),
+    await apiSection(),
     integrationsSection(present),
     generalSection(),
     h("div", {

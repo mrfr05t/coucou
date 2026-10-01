@@ -16,14 +16,36 @@ pub struct Settings {
     pub screen: String,
     pub autostart: bool,
     pub hooks_installed: bool,
-    /// Claude model used by the chat. Changeable in the settings window.
+    /// Claude model used by the chat when `provider` is "claude".
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Chat provider: "claude" (Anthropic) or "openai" (anything OpenAI-shaped).
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// Model for the OpenAI-compatible provider. Kept apart from `model` so
+    /// switching provider back and forth loses neither choice.
+    #[serde(default = "default_openai_model")]
+    pub openai_model: String,
+    /// Base URL of the OpenAI-compatible API, no trailing slash.
+    #[serde(default = "default_openai_base_url")]
+    pub openai_base_url: String,
 }
 
 fn default_model() -> String {
     crate::claude::DEFAULT_MODEL.to_string()
+}
+
+fn default_provider() -> String {
+    "claude".to_string()
+}
+
+fn default_openai_model() -> String {
+    crate::openai::DEFAULT_MODEL.to_string()
+}
+
+fn default_openai_base_url() -> String {
+    crate::openai::DEFAULT_BASE_URL.to_string()
 }
 
 impl Default for Settings {
@@ -43,6 +65,9 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            provider: default_provider(),
+            openai_model: default_openai_model(),
+            openai_base_url: default_openai_base_url(),
         }
     }
 }

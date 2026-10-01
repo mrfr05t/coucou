@@ -90,8 +90,14 @@ export interface Settings {
   screen: "primary" | "cursor";
   autostart: boolean;
   hooksInstalled: boolean;
-  /** Claude model used by the chat. */
+  /** Claude model used by the chat when `provider` is "claude". */
   model: string;
+  /** Chat provider: "claude" (Anthropic) or "openai" (anything OpenAI-shaped). */
+  provider: string;
+  /** Model for the OpenAI-compatible provider. */
+  openaiModel: string;
+  /** Base URL of the OpenAI-compatible API, no trailing slash. */
+  openaiBaseUrl: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -106,6 +112,9 @@ export const DEFAULT_SETTINGS: Settings = {
   autostart: false,
   hooksInstalled: false,
   model: "claude-opus-5",
+  provider: "claude",
+  openaiModel: "gpt-5",
+  openaiBaseUrl: "https://api.openai.com/v1",
 };
 
 type Listener = () => void;
